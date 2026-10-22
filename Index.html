@@ -218,122 +218,183 @@
   <!-- Custom Notification Banner Container -->
   <div id="toastContainer" class="fixed bottom-4 right-4 z-50 flex flex-col space-y-2 pointer-events-none"></div>
 
-  <!-- Application JavaScript -->
-  <script>
-    // Initial mock data
-    const initialData = [
-      {
-        id: "1",
-        createdBy: "Sarah",
-        clientName: "Airene",
-        affiliateName: "Affiliate Global",
-        channel: "Client Quote Request",
-        actionNote: "Asked for a custom quote on premium package",
-        status: "Pending",
-        lastInteractionTime: new Date(Date.now() - 2 * 3600 * 1000).toISOString(), // 2 hours ago
-        completedTime: null
-      },
-      {
-        id: "2",
-        createdBy: "Alex",
-        clientName: "John Smith",
-        affiliateName: "Direct Partner",
-        channel: "Email",
-        actionNote: "Emailed revised terms to Affiliate",
-        status: "Waiting",
-        lastInteractionTime: new Date(Date.now() - 26 * 3600 * 1000).toISOString(), // 26 hours ago
-        completedTime: null
-      },
-      {
-        id: "3",
-        createdBy: "Sarah",
-        clientName: "TechCorp",
-        affiliateName: "Summit Affiliates",
-        channel: "Affiliate Quote Request",
-        actionNote: "Confirmed quote details & signed contract",
-        status: "Completed",
-        lastInteractionTime: new Date(Date.now() - 48 * 3600 * 1000).toISOString(),
-        completedTime: new Date(Date.now() - 12 * 3600 * 1000).toISOString()
-      }
-    ];
+  <!-- Firebase & Application JavaScript -->
+  <script type="module">
+    import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+    import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+    import { getFirestore, collection, doc, setDoc, deleteDoc, onSnapshot } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
 
-    // Safe Storage helper to avoid SecurityError inside iframe sandboxes
-    function safeStorageGet(key, fallback) {
-      try {
-        const item = localStorage.getItem(key);
-        return item ? JSON.parse(item) : fallback;
-      } catch (e) {
-        return fallback;
-      }
+    // Firebase Setup with local state fallback
+    const appId = typeof __app_id !== 'undefined' ? __app_id : 'interaction-tracker';
+    const firebaseConfig = typeof __firebase_config !== 'undefined' 
+      ? JSON.parse(__firebase_config) 
+      : { apiKey: "demo-key", authDomain: "demo.firebaseapp.com", projectId: "demo-project" };
+
+    let app, db, auth, trackerCollectionRef;
+    try {
+      app = initializeApp(firebaseConfig);
+      db = getFirestore(app);
+      auth = getAuth(app);
+      trackerCollectionRef = collection(db, 'artifacts', appId, 'public', 'data', 'interactions');
+    } catch (e) {
+      console.warn("Firebase initialization skipped/failed, using local fallback mode.", e);
     }
 
-    function safeStorageSet(key, value) {
-      try {
-        localStorage.setItem(key, JSON.stringify(value));
-      } catch (e) {
-        // Fallback silently if storage is blocked in sandboxed iframe
-      }
-    }
-
-    // State management
-    let items = safeStorageGet('interactionTrackerData', initialData);
+    // Global state
+    let items = [];
     let currentFilter = 'all';
+    let currentUser = null;
 
-    // Auto-refresh timer every 30 seconds to recalculate relative hours
-    setInterval(() => {
-      renderTable();
-    }, 30000);
-
-    // Save state helper
-    function saveData() {
-      safeStorageSet('interactionTrackerData', items);
-      updateStats();
+    // Load initial data from localStorage if available, or use defaults
+    function loadLocalData() {
+      const saved = localStorage.getItem('interaction_tracker_data');
+      if (saved) {
+        try { return JSON.parse(saved); } catch (e) {}
+      }
+      return [
+        {
+          id: '1',
+          createdBy: 'Sarah',
+          clientName: 'Airene',
+          affiliateName: 'Nexus Network',
+          channel: 'Affiliate Quote Request',
+          status: 'Pending',
+          actionNote: 'Awaiting updated quote parameters from affiliate team',
+          lastInteractionTime: new Date(Date.now() - 28 * 3600 * 1000).toISOString(),
+          completedTime: null
+        },
+        {
+          id: '2',
+          createdBy: 'Alex',
+          clientName: 'John Smith',
+          affiliateName: 'Direct',
+          channel: 'Email',
+          status: 'In Progress',
+          actionNote: 'Sent revised agreement draft to client',
+          lastInteractionTime: new Date(Date.now() - 3 * 3600 * 1000).toISOString(),
+          completedTime: null
+        }
+      ];
     }
 
-    // Format relative time calculations
+    function saveLocalData() {
+      try {
+        localStorage.setItem('interaction_tracker_data', JSON.stringify(items));
+      } catch (e) {
+        console.warn("Unable to write to local storage", e);
+      }
+    }
+
+    // Authenticate and set up live updates with timeout safeguard
+    async function initFirebase() {
+      items = loadLocalData();
+      renderTable();
+
+      if (!auth) return;
+
+      try {
+        const authPromise = typeof __initial_auth_token !== 'undefined' && __initial_auth_token
+          ? signInWithCustomToken(auth, __initial_auth_token)
+          : signInAnonymously(auth);
+
+        // Timeout auth after 2 seconds so UI never blocks
+        await Promise.race([
+          authPromise,
+          new Promise((_, reject) => setTimeout(() => reject('Auth Timeout'), 2000))
+        ]);
+      } catch (err) {
+        console.warn("Auth initialization skipped or timed out; using local storage mode.", err);
+      }
+
+      if (auth && trackerCollectionRef) {
+        onAuthStateChanged(auth, (user) => {
+          if (user) {
+            currentUser = user;
+            subscribeToLiveUpdates();
+          }
+        });
+      }
+    }
+
+    // Real-time Firestore sync
+    function subscribeToLiveUpdates() {
+      if (!trackerCollectionRef) return;
+      onSnapshot(trackerCollectionRef, (snapshot) => {
+        const loadedItems = [];
+        snapshot.forEach((docSnap) => {
+          loadedItems.push({ id: docSnap.id, ...docSnap.data() });
+        });
+        
+        if (loadedItems.length > 0) {
+          items = loadedItems;
+          saveLocalData();
+          renderTable();
+        }
+      }, (error) => {
+        console.warn("Firestore sync unavailable, staying in local mode:", error);
+      });
+    }
+
+    // Save record with guaranteed completion (never hangs form submit)
+    async function saveRecordToCloud(itemData) {
+      saveLocalData();
+      if (!auth || !auth.currentUser || !trackerCollectionRef) return;
+      
+      try {
+        const docRef = doc(trackerCollectionRef, itemData.id);
+        const setPromise = setDoc(docRef, itemData, { merge: true });
+        // Enforce 1.5s limit on cloud write so UI remains responsive
+        await Promise.race([
+          setPromise,
+          new Promise((_, reject) => setTimeout(() => reject('Write Timeout'), 1500))
+        ]);
+      } catch (err) {
+        console.warn("Cloud sync skipped, item saved locally:", err);
+      }
+    }
+
+    // Delete record
+    async function deleteRecordFromCloud(id) {
+      saveLocalData();
+      if (!auth || !auth.currentUser || !trackerCollectionRef) return;
+      try {
+        const docRef = doc(trackerCollectionRef, id);
+        await deleteDoc(docRef);
+      } catch (err) {
+        console.warn("Cloud delete skipped, removed locally:", err);
+      }
+    }
+
+    // Helper functions for status styling and date formatting
+    function getStatusBadge(status) {
+      switch(status) {
+        case 'Pending': return 'bg-amber-100 text-amber-800 border-amber-300';
+        case 'Waiting': return 'bg-blue-100 text-blue-800 border-blue-300';
+        case 'In Progress': return 'bg-indigo-100 text-indigo-800 border-indigo-300';
+        case 'Completed': return 'bg-emerald-100 text-emerald-800 border-emerald-300';
+        default: return 'bg-slate-100 text-slate-800 border-slate-300';
+      }
+    }
+
     function getRelativeTimeString(dateIsoString) {
       if (!dateIsoString) return 'N/A';
       const now = new Date();
       const past = new Date(dateIsoString);
       const diffMs = now - past;
-      
-      if (diffMs < 0) return 'Just now';
-
       const diffMins = Math.floor(diffMs / (1000 * 60));
-      const diffHours = Math.floor(diffMs / (1000 * 60 * 60));
-      const diffDays = Math.floor(diffMs / (1000 * 60 * 60 * 24));
+      const diffHours = Math.floor(diffMs / (1000 * 3600));
+      const diffDays = Math.floor(diffMs / (1000 * 3600 * 24));
 
       if (diffMins < 1) return 'Just now';
       if (diffMins < 60) return `${diffMins}m ago`;
-      if (diffHours < 24) return `${diffHours} hr${diffHours > 1 ? 's' : ''} ago`;
-      return `${diffDays} day${diffDays > 1 ? 's' : ''} ago`;
+      if (diffHours < 24) return `${diffHours}h ago`;
+      return `${diffDays}d ago`;
     }
 
-    // Format full date time
     function formatDateTime(dateIsoString) {
-      if (!dateIsoString) return 'N/A';
+      if (!dateIsoString) return '';
       const d = new Date(dateIsoString);
-      return d.toLocaleString('en-US', {
-        month: 'short',
-        day: 'numeric',
-        hour: 'numeric',
-        minute: '2-digit',
-        hour12: true
-      });
-    }
-
-    // Get color badge class for status column
-    function getStatusBadge(status) {
-      switch (status) {
-        case 'Completed':
-          return 'bg-emerald-100 text-emerald-800 border-emerald-200';
-        case 'Pending':
-          return 'bg-amber-100 text-amber-800 border-amber-200';
-        case 'Waiting':
-          return 'bg-blue-100 text-blue-800 border-blue-200';
-        default:
-          return 'bg-slate-100 text-slate-800 border-slate-200';
-      }
+      return d.toLocaleDateString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
     }
 
     // Get color theme according to hours elapsed for last interaction badge
@@ -349,11 +410,10 @@
     function renderTable() {
       const tbody = document.getElementById('tableBody');
       const emptyState = document.getElementById('emptyState');
-      const searchVal = document.getElementById('searchInput').value.toLowerCase();
-      const sortBy = document.getElementById('sortBy').value;
+      const searchVal = (document.getElementById('searchInput')?.value || '').toLowerCase();
+      const sortBy = document.getElementById('sortBy')?.value || 'longest';
 
       let filtered = items.filter(item => {
-        // Filter tab check
         if (currentFilter === 'pending' && item.status === 'Completed') return false;
         if (currentFilter === 'completed' && item.status !== 'Completed') return false;
         if (currentFilter === 'urgent') {
@@ -361,7 +421,6 @@
           if (item.status === 'Completed' || hoursAgo < 24) return false;
         }
 
-        // Search text check
         const matchCreator = (item.createdBy || '').toLowerCase().includes(searchVal);
         const matchClient = (item.clientName || '').toLowerCase().includes(searchVal);
         const matchAffiliate = (item.affiliateName || '').toLowerCase().includes(searchVal);
@@ -370,7 +429,6 @@
         return matchCreator || matchClient || matchAffiliate || matchChannel || matchNote;
       });
 
-      // Sorting
       filtered.sort((a, b) => {
         if (sortBy === 'longest') {
           return new Date(a.lastInteractionTime) - new Date(b.lastInteractionTime);
@@ -396,7 +454,6 @@
 
         return `
           <tr class="hover:bg-slate-50/80 transition-colors">
-            <!-- 1. Created By Column -->
             <td class="py-2 px-3 align-middle">
               <div class="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-md bg-slate-100 text-slate-700 font-semibold text-xs border border-slate-200">
                 <i class="fa-regular fa-user text-[10px] text-slate-400"></i>
@@ -404,7 +461,6 @@
               </div>
             </td>
 
-            <!-- 2. Client Column -->
             <td class="py-2 px-3 align-middle">
               <div class="font-semibold text-slate-900">${escapeHtml(item.clientName || 'N/A')}</div>
               <div class="text-[11px] text-slate-500 flex items-center gap-1 mt-0.5">
@@ -412,12 +468,10 @@
               </div>
             </td>
 
-            <!-- 3. Affiliate Column -->
             <td class="py-2 px-3 align-middle text-slate-700 font-medium">
               ${escapeHtml(item.affiliateName || '-')}
             </td>
 
-            <!-- 3. Last Interacted Column -->
             <td class="py-2 px-3 align-middle">
               <div class="flex items-center space-x-2">
                 <span class="inline-flex items-center px-2 py-0.5 rounded-full text-[11px] border ${ageBadgeClass}">
@@ -433,30 +487,28 @@
               </p>
             </td>
 
-            <!-- 4. Status Column -->
             <td class="py-2 px-3 align-middle relative">
               <div class="relative inline-block text-left">
-                <button onclick="toggleStatusDropdown('${item.id}', event)" class="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-md text-xs font-semibold border ${statusBadgeClass} hover:opacity-80 transition-all cursor-pointer">
+                <button onclick="window.toggleStatusDropdown('${item.id}', event)" class="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-md text-xs font-semibold border ${statusBadgeClass} hover:opacity-80 transition-all cursor-pointer">
                   <span>${escapeHtml(item.status)}</span>
                   <i class="fa-solid fa-chevron-down text-[9px] opacity-60"></i>
                 </button>
 
-                <!-- Status Select Dropdown Menu -->
                 <div id="statusMenu-${item.id}" class="hidden absolute left-0 top-full mt-1 w-36 bg-white border border-slate-200 rounded-lg shadow-xl z-50 py-1 text-xs">
-                  <button onclick="changeStatus('${item.id}', 'Pending', event)" class="w-full text-left px-3 py-1.5 hover:bg-amber-50 text-amber-800 flex items-center space-x-2 font-medium">
+                  <button onclick="window.changeStatus('${item.id}', 'Pending', event)" class="w-full text-left px-3 py-1.5 hover:bg-amber-50 text-amber-800 flex items-center space-x-2 font-medium">
                     <span class="w-2 h-2 rounded-full bg-amber-500"></span>
                     <span>Pending</span>
                   </button>
-                  <button onclick="changeStatus('${item.id}', 'Waiting', event)" class="w-full text-left px-3 py-1.5 hover:bg-blue-50 text-blue-800 flex items-center space-x-2 font-medium">
+                  <button onclick="window.changeStatus('${item.id}', 'Waiting', event)" class="w-full text-left px-3 py-1.5 hover:bg-blue-50 text-blue-800 flex items-center space-x-2 font-medium">
                     <span class="w-2 h-2 rounded-full bg-blue-500"></span>
                     <span>Waiting</span>
                   </button>
-                  <button onclick="changeStatus('${item.id}', 'In Progress', event)" class="w-full text-left px-3 py-1.5 hover:bg-indigo-50 text-indigo-800 flex items-center space-x-2 font-medium">
+                  <button onclick="window.changeStatus('${item.id}', 'In Progress', event)" class="w-full text-left px-3 py-1.5 hover:bg-indigo-50 text-indigo-800 flex items-center space-x-2 font-medium">
                     <span class="w-2 h-2 rounded-full bg-indigo-500"></span>
                     <span>In Progress</span>
                   </button>
                   <div class="border-t border-slate-100 my-0.5"></div>
-                  <button onclick="changeStatus('${item.id}', 'Completed', event)" class="w-full text-left px-3 py-1.5 hover:bg-emerald-50 text-emerald-800 flex items-center space-x-2 font-medium">
+                  <button onclick="window.changeStatus('${item.id}', 'Completed', event)" class="w-full text-left px-3 py-1.5 hover:bg-emerald-50 text-emerald-800 flex items-center space-x-2 font-medium">
                     <span class="w-2 h-2 rounded-full bg-emerald-500"></span>
                     <span>Completed</span>
                   </button>
@@ -471,23 +523,22 @@
               ` : ''}
             </td>
 
-            <!-- Actions Column -->
             <td class="py-2 px-3 align-middle text-right">
               <div class="flex items-center justify-end space-x-1">
                 ${!isCompleted ? `
-                  <button onclick="markAsCompleted('${item.id}')" title="Mark as Completed" class="px-2 py-0.5 bg-emerald-600 hover:bg-emerald-700 text-white rounded text-xs font-medium transition-colors">
+                  <button onclick="window.markAsCompleted('${item.id}')" title="Mark as Completed" class="px-2 py-0.5 bg-emerald-600 hover:bg-emerald-700 text-white rounded text-xs font-medium transition-colors">
                     Done
                   </button>
                 ` : `
-                  <button onclick="reopenItem('${item.id}')" title="Re-open" class="px-2 py-0.5 bg-amber-100 text-amber-800 hover:bg-amber-200 rounded text-xs font-medium transition-colors">
+                  <button onclick="window.reopenItem('${item.id}')" title="Re-open" class="px-2 py-0.5 bg-amber-100 text-amber-800 hover:bg-amber-200 rounded text-xs font-medium transition-colors">
                     Re-open
                   </button>
                 `}
 
-                <button onclick="editItem('${item.id}')" title="Edit" class="p-1 text-slate-400 hover:text-slate-600 hover:bg-slate-100 rounded">
+                <button onclick="window.editItem('${item.id}')" title="Edit" class="p-1 text-slate-400 hover:text-slate-600 hover:bg-slate-100 rounded">
                   <i class="fa-solid fa-pen text-xs"></i>
                 </button>
-                <button onclick="deleteItem('${item.id}')" title="Delete" class="p-1 text-slate-400 hover:text-rose-600 hover:bg-rose-50 rounded">
+                <button onclick="window.deleteItem('${item.id}')" title="Delete" class="p-1 text-slate-400 hover:text-rose-600 hover:bg-rose-50 rounded">
                   <i class="fa-solid fa-trash-can text-xs"></i>
                 </button>
               </div>
@@ -500,9 +551,8 @@
     }
 
     // Toggle status inline dropdown
-    function toggleStatusDropdown(id, e) {
+    window.toggleStatusDropdown = function(id, e) {
       if (e) e.stopPropagation();
-      // Close all other dropdowns first
       document.querySelectorAll('[id^="statusMenu-"]').forEach(el => {
         if (el.id !== `statusMenu-${id}`) el.classList.add('hidden');
       });
@@ -511,26 +561,25 @@
       if (menu) {
         menu.classList.toggle('hidden');
       }
-    }
+    };
 
     // Change status directly from status badge
-    function changeStatus(id, newStatus, e) {
+    window.changeStatus = async function(id, newStatus, e) {
       if (e) e.stopPropagation();
-      const index = items.findIndex(i => i.id === id);
-      if (index !== -1) {
-        items[index].status = newStatus;
-        if (newStatus === 'Completed') {
-          if (!items[index].completedTime) {
-            items[index].completedTime = new Date().toISOString();
-          }
-        } else {
-          items[index].completedTime = null;
-        }
-        saveData();
+      const item = items.find(i => i.id === id);
+      if (item) {
+        const updatedItem = {
+          ...item,
+          status: newStatus,
+          completedTime: newStatus === 'Completed' ? (item.completedTime || new Date().toISOString()) : null
+        };
+        const index = items.findIndex(i => i.id === id);
+        if (index !== -1) items[index] = updatedItem;
         renderTable();
         showToast(`Status updated to "${newStatus}"`);
+        await saveRecordToCloud(updatedItem);
       }
-    }
+    };
 
     // Close status menus when clicking anywhere outside
     document.addEventListener('click', () => {
@@ -554,7 +603,7 @@
     }
 
     // Set active filter
-    function setFilter(filterName) {
+    window.setFilter = function(filterName) {
       currentFilter = filterName;
       document.querySelectorAll('.filter-tab').forEach(tab => {
         tab.classList.remove('bg-white', 'text-slate-800', 'shadow-sm');
@@ -568,10 +617,10 @@
       }
 
       renderTable();
-    }
+    };
 
-    // Handle Form submission
-    function handleFormSubmit(e) {
+    // Handle Form submission instantly
+    window.handleFormSubmit = async function(e) {
       e.preventDefault();
       const id = document.getElementById('editId').value;
       const createdBy = document.getElementById('createdBy').value.trim();
@@ -584,29 +633,30 @@
 
       const interactionIso = new Date(interactionTimeInput).toISOString();
 
+      let targetItem;
+
       if (id) {
-        // Edit existing item
-        const index = items.findIndex(item => item.id === id);
-        if (index !== -1) {
-          items[index].createdBy = createdBy;
-          items[index].clientName = clientName;
-          items[index].affiliateName = affiliateName;
-          items[index].channel = channel;
-          items[index].status = status;
-          items[index].actionNote = actionNote;
-          items[index].lastInteractionTime = interactionIso;
-
-          if (status === 'Completed' && !items[index].completedTime) {
-            items[index].completedTime = new Date().toISOString();
-          } else if (status !== 'Completed') {
-            items[index].completedTime = null;
-          }
-
-          showToast("Record updated successfully");
+        const existingIndex = items.findIndex(item => item.id === id);
+        const existingItem = items[existingIndex] || {};
+        targetItem = {
+          ...existingItem,
+          id,
+          createdBy,
+          clientName,
+          affiliateName,
+          channel,
+          status,
+          actionNote,
+          lastInteractionTime: interactionIso,
+          completedTime: status === 'Completed' ? (existingItem?.completedTime || new Date().toISOString()) : null
+        };
+        
+        if (existingIndex !== -1) {
+          items[existingIndex] = targetItem;
         }
+        showToast("Record updated");
       } else {
-        // Create new item
-        const newItem = {
+        targetItem = {
           id: Date.now().toString(),
           createdBy,
           clientName,
@@ -617,44 +667,56 @@
           lastInteractionTime: interactionIso,
           completedTime: status === 'Completed' ? new Date().toISOString() : null
         };
-        items.unshift(newItem);
+
+        items.unshift(targetItem);
         showToast("New interaction logged");
       }
 
-      saveData();
+      // Close modal and refresh UI instantly
+      window.closeModal();
       renderTable();
-      closeModal();
-    }
+
+      // Non-blocking async background cloud sync
+      saveRecordToCloud(targetItem);
+    };
 
     // Mark completed
-    function markAsCompleted(id) {
-      const index = items.findIndex(i => i.id === id);
-      if (index !== -1) {
+    window.markAsCompleted = async function(id) {
+      const itemIndex = items.findIndex(i => i.id === id);
+      if (itemIndex !== -1) {
         const now = new Date().toISOString();
-        items[index].status = 'Completed';
-        items[index].completedTime = now;
-        items[index].lastInteractionTime = now;
-        saveData();
+        const updatedItem = {
+          ...items[itemIndex],
+          status: 'Completed',
+          completedTime: now,
+          lastInteractionTime: now
+        };
+        items[itemIndex] = updatedItem;
         renderTable();
-        showToast(`Marked ${items[index].clientName} as completed`);
+        showToast(`Marked ${updatedItem.clientName} as completed`);
+        await saveRecordToCloud(updatedItem);
       }
-    }
+    };
 
     // Reopen completed item
-    function reopenItem(id) {
-      const index = items.findIndex(i => i.id === id);
-      if (index !== -1) {
-        items[index].status = 'Pending';
-        items[index].completedTime = null;
-        items[index].lastInteractionTime = new Date().toISOString();
-        saveData();
+    window.reopenItem = async function(id) {
+      const itemIndex = items.findIndex(i => i.id === id);
+      if (itemIndex !== -1) {
+        const updatedItem = {
+          ...items[itemIndex],
+          status: 'Pending',
+          completedTime: null,
+          lastInteractionTime: new Date().toISOString()
+        };
+        items[itemIndex] = updatedItem;
         renderTable();
-        showToast(`Reopened tracker for ${items[index].clientName}`);
+        showToast(`Reopened tracker for ${updatedItem.clientName}`);
+        await saveRecordToCloud(updatedItem);
       }
-    }
+    };
 
     // Edit item
-    function editItem(id) {
+    window.editItem = function(id) {
       const item = items.find(i => i.id === id);
       if (!item) return;
 
@@ -666,45 +728,45 @@
       document.getElementById('status').value = item.status || 'Pending';
       document.getElementById('actionNote').value = item.actionNote || '';
       
-      // Convert ISO date to datetime-local format
       const date = new Date(item.lastInteractionTime);
       date.setMinutes(date.getMinutes() - date.getTimezoneOffset());
       document.getElementById('interactionTime').value = date.toISOString().slice(0, 16);
 
       document.getElementById('modalTitle').innerText = 'Edit Record';
       document.getElementById('itemModal').classList.remove('hidden');
-    }
+    };
 
-    // Delete item directly without modal blocking
-    function deleteItem(id) {
+    // Delete item
+    window.deleteItem = async function(id) {
       const itemToDelete = items.find(i => i.id === id);
       const clientName = itemToDelete ? itemToDelete.clientName : 'Record';
       
       items = items.filter(i => i.id !== id);
-      saveData();
       renderTable();
       showToast(`Deleted ${clientName}`);
-    }
+      await deleteRecordFromCloud(id);
+    };
 
     // Modal controls
-    function openModal() {
+    window.openModal = function() {
       document.getElementById('trackerForm').reset();
       document.getElementById('editId').value = '';
       
-      // Default datetime picker to current local time
       const now = new Date();
       now.setMinutes(now.getMinutes() - now.getTimezoneOffset());
       document.getElementById('interactionTime').value = now.toISOString().slice(0, 16);
 
       document.getElementById('modalTitle').innerText = 'Record New Interaction';
       document.getElementById('itemModal').classList.remove('hidden');
-    }
+    };
 
-    function closeModal() {
+    window.closeModal = function() {
       document.getElementById('itemModal').classList.add('hidden');
-    }
+    };
 
-    // HTML Sanitizer helper
+    // Make renderTable globally accessible
+    window.renderTable = renderTable;
+
     function escapeHtml(str) {
       if (!str) return '';
       return str.replace(/&/g, "&amp;")
@@ -714,9 +776,9 @@
                 .replace(/'/g, "&#039;");
     }
 
-    // Toast notification UI
     function showToast(message) {
       const container = document.getElementById('toastContainer');
+      if (!container) return;
       const toast = document.createElement('div');
       toast.className = 'bg-slate-900 text-white px-4 py-2.5 rounded-lg shadow-lg text-xs font-medium flex items-center space-x-2 pointer-events-auto transform transition-all duration-300 translate-y-2 opacity-0';
       toast.innerHTML = `<i class="fa-solid fa-circle-check text-emerald-400"></i><span>${escapeHtml(message)}</span>`;
@@ -733,9 +795,9 @@
       }, 3000);
     }
 
-    // Initial render call on page load
+    // Initialize application
     window.onload = function() {
-      renderTable();
+      initFirebase();
     };
   </script>
 </body>
